@@ -33,7 +33,12 @@ class WoundWiseDataset(Dataset):
         
     def _load_data(self) -> List[Dict]:
         """Load dataset from JSON file."""
-        file_path = os.path.join(self.data_path, f"mediqa-wv-{self.split}.json")
+        # Updated to use correct file paths based on the actual structure
+        file_path = os.path.join(self.data_path, f"{self.split}.json")
+        
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Data file not found: {file_path}")
+            
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         return data
@@ -54,15 +59,19 @@ class WoundWiseDataset(Dataset):
         for image_id in item['image_ids']:
             image_path = os.path.join(self.images_path, image_id)
             if os.path.exists(image_path):
-                image = Image.open(image_path).convert('RGB')
-                images.append(image)
+                try:
+                    image = Image.open(image_path).convert('RGB')
+                    images.append(image)
+                except Exception as e:
+                    print(f"Error loading image {image_path}: {e}")
         
-        # Get response(s)
+        # Get response(s) - handle the actual data structure
         responses = []
-        for response in item['responses']:
-            response_text = response.get(f'content_{self.language}', '')
-            if response_text:
-                responses.append(response_text)
+        if 'responses' in item and item['responses']:
+            for response in item['responses']:
+                response_text = response.get(f'content_{self.language}', '')
+                if response_text:
+                    responses.append(response_text)
         
         # Get metadata
         metadata = {
@@ -127,29 +136,48 @@ def create_data_loaders(
     batch_size: int = 8,
     processor=None,
     tokenizer=None
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
     """Create train, validation, and test data loaders."""
     
     datasets = {}
-    for split in ['train', 'valid', 'test']:
-        datasets[split] = WoundWiseDataset(
-            data_path=data_path,
-            images_path=os.path.join(images_path, f"images_{split}"),
-            split=split,
-            language=language,
-            processor=processor,
-            tokenizer=tokenizer
-        )
-    
     data_loaders = {}
-    for split, dataset in datasets.items():
+    
+    # Check which splits are available
+    available_splits = []
+    for split in ['train', 'valid', 'test']:
+        file_path = os.path.join(data_path, f"{split}.json")
+        if os.path.exists(file_path):
+            available_splits.append(split)
+            
+            # Determine image folder path
+            if split == 'valid':
+                img_folder = os.path.join(images_path, "images_valid")
+            else:
+                img_folder = os.path.join(images_path, f"images_{split}")
+            
+            datasets[split] = WoundWiseDataset(
+                data_path=data_path,
+                images_path=img_folder,
+                split=split,
+                language=language,
+                processor=processor,
+                tokenizer=tokenizer
+            )
+    
+    # Create data loaders for available splits
+    for split in available_splits:
         shuffle = split == 'train'
         data_loaders[split] = DataLoader(
-            dataset,
+            datasets[split],
             batch_size=batch_size,
             shuffle=shuffle,
-            collate_fn=dataset.collate_fn,
-            num_workers=4
+            collate_fn=datasets[split].collate_fn,
+            num_workers=2  # Reduced from 4 for better compatibility
         )
     
-    return data_loaders['train'], data_loaders['valid'], data_loaders['test']
+    # Return in expected order (train, valid, test)
+    train_loader = data_loaders.get('train')
+    valid_loader = data_loaders.get('valid')
+    test_loader = data_loaders.get('test')
+    
+    return train_loader, valid_loader, test_loader

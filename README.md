@@ -53,20 +53,22 @@ Each query instance includes:
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/ctava-msft/ai-top.git
-cd ai-top/woundwise
+git clone https://github.com/ctava-msft/woundwise.git
 ```
 
 2. Install dependencies:
+# setup venv environment
+
+```
+python -m venv .venv
+./.venv/Scripts/activate
+pip install -r requirements.txt
+```
+
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Download NLTK data (if needed):
-```python
-import nltk
-nltk.download('punkt')
-nltk.download('wordnet')
 ```
 
 ## Usage

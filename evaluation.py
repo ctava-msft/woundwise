@@ -4,19 +4,7 @@ from sacrebleu import BLEU, CHRF
 from nltk.translate.bleu_score import corpus_bleu, sentence_bleu
 from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer
-import nltk
 from collections import defaultdict
-
-# Download required NLTK data
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
-
-try:
-    nltk.data.find('corpora/wordnet')
-except LookupError:
-    nltk.download('wordnet')
 
 def compute_bleu_scores(predictions: List[str], references: List[List[str]], language: str = "en") -> Dict[str, float]:
     """Compute BLEU scores using sacrebleu."""
@@ -32,17 +20,21 @@ def compute_bleu_scores(predictions: List[str], references: List[List[str]], lan
     # Choose tokenizer based on language
     tokenize = '13a' if language == 'en' else 'zh'
     
-    bleu = BLEU(tokenize=tokenize)
-    chrf = CHRF()
-    
-    # Compute corpus-level scores
-    bleu_score = bleu.corpus_score(predictions, ref_lists)
-    chrf_score = chrf.corpus_score(predictions, ref_lists)
-    
-    return {
-        'bleu': bleu_score.score,
-        'chrf': chrf_score.score
-    }
+    try:
+        bleu = BLEU(tokenize=tokenize)
+        chrf = CHRF()
+        
+        # Compute corpus-level scores
+        bleu_score = bleu.corpus_score(predictions, ref_lists)
+        chrf_score = chrf.corpus_score(predictions, ref_lists)
+        
+        return {
+            'bleu': bleu_score.score,
+            'chrf': chrf_score.score
+        }
+    except Exception as e:
+        print(f"Error computing BLEU/chrF scores: {e}")
+        return {'bleu': 0.0, 'chrf': 0.0}
 
 def compute_rouge_scores(predictions: List[str], references: List[str]) -> Dict[str, float]:
     """Compute ROUGE scores."""
@@ -185,19 +177,40 @@ def evaluate_model(
             batch_references = batch['responses']
             batch_metadata = batch['metadata']
             
+            # Handle different text input formats
+            if isinstance(query_texts, dict):
+                # Tokenized inputs from transformers
+                query_texts = batch.get('query_text', [''] * len(images))
+            elif not isinstance(query_texts, list):
+                query_texts = [''] * len(images)
+            
             # Generate predictions for each item in batch
-            for i, (image, query) in enumerate(zip(images, query_texts)):
+            for i, image_list in enumerate(images):
                 try:
-                    if image and len(image) > 0:
-                        pred = model.generate_response(image[0], query)
+                    if image_list and len(image_list) > 0:
+                        # Use first image if multiple images
+                        query = query_texts[i] if i < len(query_texts) else ""
+                        pred = model.generate_response(image_list[0], query)
                         predictions.append(pred)
-                        references.append(batch_references[i])
-                        metadata_list.append(batch_metadata[i])
+                        
+                        # Handle references
+                        ref = batch_references[i] if i < len(batch_references) else []
+                        if isinstance(ref, str):
+                            references.append([ref])
+                        elif isinstance(ref, list):
+                            references.append(ref)
+                        else:
+                            references.append([""])
+                        
+                        # Handle metadata
+                        meta = batch_metadata[i] if i < len(batch_metadata) else {}
+                        metadata_list.append(meta)
+                        
                 except Exception as e:
-                    print(f"Error generating response: {e}")
+                    print(f"Error generating response for sample {i}: {e}")
                     predictions.append("")
-                    references.append(batch_references[i] if i < len(batch_references) else [""])
-                    metadata_list.append(batch_metadata[i] if i < len(batch_metadata) else {})
+                    references.append([""])
+                    metadata_list.append({})
     
     # Compute overall metrics
     overall_metrics = compute_metrics(predictions, references, language)
@@ -224,7 +237,9 @@ def evaluate_model(
     return {
         'overall_metrics': overall_metrics,
         'per_wound_type_metrics': per_type_metrics,
-        'num_samples': len(predictions)
+        'num_samples': len(predictions),
+        'predictions': predictions,
+        'references': references
     }
 
 def print_evaluation_results(results: Dict[str, Any]):
