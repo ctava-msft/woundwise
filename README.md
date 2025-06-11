@@ -93,8 +93,8 @@ Train the VQA model using the provided training script:
 
 ```bash
 python train.py \
-    --data_path /path/to/dataset \
-    --images_path /path/to/images \
+    --data_path ./data \
+    --images_path ./data \
     --model_name Salesforce/blip-image-captioning-base \
     --language en \
     --batch_size 8 \

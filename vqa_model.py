@@ -38,7 +38,7 @@ class WoundWiseVQAModel(nn.Module):
     
     def forward(
         self,
-        images: List[torch.Tensor],
+        images: List,
         query_texts: List[str],
         target_texts: Optional[List[str]] = None
     ) -> Dict[str, torch.Tensor]:
@@ -47,34 +47,94 @@ class WoundWiseVQAModel(nn.Module):
         batch_size = len(query_texts)
         device = next(self.parameters()).device
         
-        # Process inputs
+        # Process inputs individually first
         processed_inputs = []
+        valid_indices = []
+        
         for i in range(batch_size):
-            if images[i] is not None and len(images[i]) > 0:
-                # Use first image if multiple images
-                image = images[i][0] if isinstance(images[i], list) else images[i]
-                inputs = self.processor(
-                    image,
-                    query_texts[i],
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=self.max_length
-                )
-                processed_inputs.append(inputs)
+            # Handle different image formats
+            image_list = images[i] if i < len(images) else []
+            
+            if image_list and len(image_list) > 0:
+                # Get the first image (PIL Image)
+                image = image_list[0]
+                
+                # Process with the processor
+                try:
+                    inputs = self.processor(
+                        image,
+                        query_texts[i],
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_length
+                    )
+                    processed_inputs.append(inputs)
+                    valid_indices.append(i)
+                except Exception as e:
+                    print(f"Error processing image {i}: {e}")
+                    continue
         
         if not processed_inputs:
             return {"loss": torch.tensor(0.0, device=device)}
         
-        # Batch processing
-        pixel_values = torch.cat([inp['pixel_values'] for inp in processed_inputs]).to(device)
-        input_ids = torch.cat([inp['input_ids'] for inp in processed_inputs]).to(device)
-        attention_mask = torch.cat([inp['attention_mask'] for inp in processed_inputs]).to(device)
+        # Batch processing with proper padding
+        try:
+            # Collect all pixel values - these should be the same size
+            pixel_values_list = []
+            input_ids_list = []
+            attention_mask_list = []
+            
+            for inputs in processed_inputs:
+                pixel_values_list.append(inputs['pixel_values'].squeeze(0))
+                input_ids_list.append(inputs['input_ids'].squeeze(0))
+                attention_mask_list.append(inputs['attention_mask'].squeeze(0))
+            
+            # Stack pixel values (should be same size)
+            pixel_values = torch.stack(pixel_values_list).to(device)
+            
+            # Pad sequences to same length
+            max_seq_len = max(ids.size(0) for ids in input_ids_list)
+            
+            padded_input_ids = []
+            padded_attention_masks = []
+            
+            for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
+                # Pad to max length
+                seq_len = input_ids.size(0)
+                if seq_len < max_seq_len:
+                    # Pad with tokenizer's pad_token_id
+                    pad_token_id = self.processor.tokenizer.pad_token_id or 0
+                    padding = torch.full((max_seq_len - seq_len,), pad_token_id, dtype=input_ids.dtype)
+                    padded_input_ids.append(torch.cat([input_ids, padding]))
+                    
+                    # Pad attention mask with zeros
+                    att_padding = torch.zeros((max_seq_len - seq_len,), dtype=attention_mask.dtype)
+                    padded_attention_masks.append(torch.cat([attention_mask, att_padding]))
+                else:
+                    padded_input_ids.append(input_ids)
+                    padded_attention_masks.append(attention_mask)
+            
+            input_ids = torch.stack(padded_input_ids).to(device)
+            attention_mask = torch.stack(padded_attention_masks).to(device)
+            
+        except Exception as e:
+            print(f"Error batching inputs: {e}")
+            print(f"Number of processed inputs: {len(processed_inputs)}")
+            for i, inputs in enumerate(processed_inputs):
+                print(f"Input {i} shapes:")
+                for key, value in inputs.items():
+                    if torch.is_tensor(value):
+                        print(f"  {key}: {value.shape}")
+            return {"loss": torch.tensor(0.0, device=device)}
         
         if target_texts is not None:
             # Training mode - compute loss
+            # Only use target texts for samples that have valid images
+            valid_targets = [target_texts[i] for i in valid_indices]
+            
             target_encodings = self.text_tokenizer(
-                target_texts,
+                valid_targets,
                 padding=True,
                 truncation=True,
                 max_length=self.max_length,
@@ -109,23 +169,54 @@ class WoundWiseVQAModel(nn.Module):
     
     def generate_response(
         self,
-        image: torch.Tensor,
+        image,
         query_text: str
     ) -> str:
         """Generate a response for a single image-query pair."""
         
         self.eval()
+        device = next(self.parameters()).device
+        
         with torch.no_grad():
-            outputs = self.forward([image], [query_text])
-            generated_ids = outputs["generated_ids"]
-            
-            # Decode generated text
-            response = self.text_tokenizer.decode(
-                generated_ids[0],
-                skip_special_tokens=True
-            )
-            
-        return response
+            try:
+                # Process single image and text
+                inputs = self.processor(
+                    image,
+                    query_text,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length
+                )
+                
+                # Move to device
+                for key in inputs:
+                    if torch.is_tensor(inputs[key]):
+                        inputs[key] = inputs[key].to(device)
+                
+                # Generate response
+                generated_ids = self.model.generate(
+                    pixel_values=inputs['pixel_values'],
+                    input_ids=inputs['input_ids'],
+                    attention_mask=inputs['attention_mask'],
+                    max_length=self.max_length,
+                    num_beams=4,
+                    early_stopping=True,
+                    do_sample=True,
+                    temperature=0.7
+                )
+                
+                # Decode generated text
+                response = self.text_tokenizer.decode(
+                    generated_ids[0],
+                    skip_special_tokens=True
+                )
+                
+                return response
+                
+            except Exception as e:
+                print(f"Error generating response: {e}")
+                return "Unable to generate response for this image."
 
 class MultimodalEncoder(nn.Module):
     """Custom multimodal encoder for wound care VQA."""

@@ -112,19 +112,22 @@ class WoundWiseDataset(Dataset):
         else:
             text_inputs = query_texts
         
-        # Process images
+        # Process images - keep as PIL Images for now
+        # The model will handle the processing
         processed_images = []
-        if self.processor and all_images:
-            for images in all_images:
-                if images:
-                    # Take first image if multiple
-                    image_inputs = self.processor(images[0], return_tensors="pt")
-                    processed_images.append(image_inputs)
+        for images in all_images:
+            if images and len(images) > 0:
+                # Keep the list of PIL images
+                processed_images.append(images)
+            else:
+                # Add empty list for missing images
+                processed_images.append([])
         
         return {
             'encounter_ids': encounter_ids,
             'text_inputs': text_inputs,
-            'images': processed_images if processed_images else all_images,
+            'query_text': query_texts,  # Keep original text for reference
+            'images': processed_images,
             'responses': all_responses,
             'metadata': metadata
         }

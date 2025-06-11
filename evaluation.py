@@ -3,8 +3,15 @@ from typing import List, Dict, Any
 from sacrebleu import BLEU, CHRF
 from nltk.translate.bleu_score import corpus_bleu, sentence_bleu
 from nltk.translate.meteor_score import meteor_score
-from rouge_score import rouge_scorer
 from collections import defaultdict
+
+# Optional imports with fallbacks
+try:
+    from rouge_score import rouge_scorer
+    ROUGE_AVAILABLE = True
+except ImportError:
+    print("Warning: rouge_score not available. ROUGE metrics will be skipped.")
+    ROUGE_AVAILABLE = False
 
 def compute_bleu_scores(predictions: List[str], references: List[List[str]], language: str = "en") -> Dict[str, float]:
     """Compute BLEU scores using sacrebleu."""
@@ -39,43 +46,86 @@ def compute_bleu_scores(predictions: List[str], references: List[List[str]], lan
 def compute_rouge_scores(predictions: List[str], references: List[str]) -> Dict[str, float]:
     """Compute ROUGE scores."""
     
-    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    if not ROUGE_AVAILABLE:
+        print("ROUGE scorer not available, skipping ROUGE metrics")
+        return {}
     
-    rouge_scores = defaultdict(list)
-    
-    for pred, ref in zip(predictions, references):
-        if isinstance(ref, list):
-            ref = ref[0]  # Use first reference if multiple
+    try:
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
         
-        scores = scorer.score(ref, pred)
-        for metric, score in scores.items():
-            rouge_scores[f'{metric}_f'].append(score.fmeasure)
-            rouge_scores[f'{metric}_p'].append(score.precision)
-            rouge_scores[f'{metric}_r'].append(score.recall)
-    
-    # Average scores
-    avg_scores = {}
-    for metric, scores in rouge_scores.items():
-        avg_scores[metric] = np.mean(scores)
-    
-    return avg_scores
+        rouge_scores = defaultdict(list)
+        
+        for pred, ref in zip(predictions, references):
+            if isinstance(ref, list):
+                ref = ref[0]  # Use first reference if multiple
+            
+            scores = scorer.score(ref, pred)
+            for metric, score in scores.items():
+                rouge_scores[f'{metric}_f'].append(score.fmeasure)
+                rouge_scores[f'{metric}_p'].append(score.precision)
+                rouge_scores[f'{metric}_r'].append(score.recall)
+        
+        # Average scores
+        avg_scores = {}
+        for metric, scores in rouge_scores.items():
+            avg_scores[metric] = np.mean(scores)
+        
+        return avg_scores
+    except Exception as e:
+        print(f"Error computing ROUGE scores: {e}")
+        return {}
 
 def compute_meteor_scores(predictions: List[str], references: List[str]) -> float:
     """Compute METEOR scores."""
     
-    meteor_scores = []
-    
-    for pred, ref in zip(predictions, references):
-        if isinstance(ref, list):
-            ref = ref[0]  # Use first reference if multiple
+    try:
+        meteor_scores = []
         
-        try:
-            score = meteor_score([ref.split()], pred.split())
-            meteor_scores.append(score)
-        except:
-            meteor_scores.append(0.0)
+        for pred, ref in zip(predictions, references):
+            if isinstance(ref, list):
+                ref = ref[0]  # Use first reference if multiple
+            
+            try:
+                score = meteor_score([ref.split()], pred.split())
+                meteor_scores.append(score)
+            except:
+                meteor_scores.append(0.0)
+        
+        return np.mean(meteor_scores)
+    except Exception as e:
+        print(f"Error computing METEOR scores: {e}")
+        return 0.0
+
+def compute_nltk_bleu_scores(predictions: List[str], references: List[str]) -> Dict[str, float]:
+    """Compute BLEU scores using NLTK as fallback."""
     
-    return np.mean(meteor_scores)
+    try:
+        # Prepare references for NLTK
+        tokenized_refs = []
+        tokenized_preds = []
+        
+        for pred, ref in zip(predictions, references):
+            if isinstance(ref, list):
+                ref = ref[0]  # Use first reference if multiple
+            
+            tokenized_preds.append(pred.split())
+            tokenized_refs.append([ref.split()])
+        
+        # Compute BLEU scores
+        bleu1 = corpus_bleu(tokenized_refs, tokenized_preds, weights=(1, 0, 0, 0))
+        bleu2 = corpus_bleu(tokenized_refs, tokenized_preds, weights=(0.5, 0.5, 0, 0))
+        bleu3 = corpus_bleu(tokenized_refs, tokenized_preds, weights=(0.33, 0.33, 0.33, 0))
+        bleu4 = corpus_bleu(tokenized_refs, tokenized_preds, weights=(0.25, 0.25, 0.25, 0.25))
+        
+        return {
+            'nltk_bleu1': bleu1,
+            'nltk_bleu2': bleu2,
+            'nltk_bleu3': bleu3,
+            'nltk_bleu4': bleu4
+        }
+    except Exception as e:
+        print(f"Error computing NLTK BLEU scores: {e}")
+        return {}
 
 def compute_length_stats(predictions: List[str], references: List[str]) -> Dict[str, float]:
     """Compute length statistics."""
@@ -123,15 +173,21 @@ def compute_metrics(
     metrics = {}
     
     try:
-        # BLEU and chrF scores
+        # BLEU and chrF scores using sacrebleu
         bleu_scores = compute_bleu_scores(predictions, [flat_references], language)
         metrics.update(bleu_scores)
     except Exception as e:
-        print(f"Error computing BLEU scores: {e}")
-        metrics.update({'bleu': 0.0, 'chrf': 0.0})
+        print(f"Error computing sacrebleu scores: {e}")
+        # Fallback to NLTK BLEU
+        try:
+            nltk_bleu_scores = compute_nltk_bleu_scores(predictions, flat_references)
+            metrics.update(nltk_bleu_scores)
+        except Exception as e2:
+            print(f"Error computing NLTK BLEU scores: {e2}")
+            metrics.update({'bleu': 0.0, 'chrf': 0.0})
     
     try:
-        # ROUGE scores
+        # ROUGE scores (optional)
         rouge_scores = compute_rouge_scores(predictions, flat_references)
         metrics.update(rouge_scores)
     except Exception as e:

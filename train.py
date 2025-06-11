@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
 from transformers import get_linear_schedule_with_warmup
+from typing import Dict, List, Optional
 import wandb
 from tqdm import tqdm
 import json
@@ -29,48 +30,59 @@ def train_epoch(
     
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
-    for batch in progress_bar:
-        optimizer.zero_grad()
-        
-        # Prepare inputs
-        images = batch['images']
-        query_texts = [inp for inp in batch['text_inputs']]
-        target_texts = [resp[0] if resp else "" for resp in batch['responses']]
-        
-        # Forward pass
-        outputs = model(
-            images=images,
-            query_texts=query_texts,
-            target_texts=target_texts
-        )
-        
-        loss = outputs.get('loss', torch.tensor(0.0))
-        
-        if loss.item() > 0:
-            # Backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
+    for batch_idx, batch in enumerate(progress_bar):
+        try:
+            optimizer.zero_grad()
             
-            total_loss += loss.item()
-            num_batches += 1
+            # Prepare inputs
+            images = batch['images']
+            query_texts = batch.get('query_text', [])  # Use original text
+            target_texts = [resp[0] if resp else "" for resp in batch['responses']]
             
-            progress_bar.set_postfix({'loss': loss.item()})
+            # Skip batch if no valid samples
+            if not any(img_list for img_list in images):
+                print(f"Skipping batch {batch_idx}: no valid images")
+                continue
             
-            # Log to wandb
-            if wandb.run:
-                wandb.log({
-                    'train_loss': loss.item(),
-                    'learning_rate': scheduler.get_last_lr()[0]
-                })
+            # Forward pass
+            outputs = model(
+                images=images,
+                query_texts=query_texts,
+                target_texts=target_texts
+            )
+            
+            loss = outputs.get('loss', torch.tensor(0.0))
+            
+            if loss.item() > 0:
+                # Backward pass
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                
+                total_loss += loss.item()
+                num_batches += 1
+                
+                progress_bar.set_postfix({'loss': loss.item()})
+                
+                # Log to wandb
+                if wandb.run:
+                    wandb.log({
+                        'train_loss': loss.item(),
+                        'learning_rate': scheduler.get_last_lr()[0]
+                    })
+            
+        except Exception as e:
+            print(f"Error in batch {batch_idx}: {e}")
+            continue
     
     return total_loss / max(num_batches, 1)
 
 def validate_model(
     model: nn.Module,
     dataloader,
-    device: torch.device
+    device: torch.device,
+    language: str = "en"
 ) -> Dict[str, float]:
     """Validate the model."""
     
@@ -81,18 +93,44 @@ def validate_model(
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validating"):
             images = batch['images']
-            query_texts = [inp for inp in batch['text_inputs']]
-            target_texts = [resp for resp in batch['responses']]
+            
+            # Handle different text input formats
+            if isinstance(batch['text_inputs'], dict):
+                # Tokenized inputs - extract original text if available
+                query_texts = batch.get('query_text', [''] * len(images))
+            else:
+                query_texts = batch['text_inputs']
+            
+            target_texts = batch['responses']
             
             # Generate predictions
-            for i, (image, query) in enumerate(zip(images, query_texts)):
-                if image:
-                    pred = model.generate_response(image, query)
-                    predictions.append(pred)
-                    references.append(target_texts[i])
+            for i, (image_list, query) in enumerate(zip(images, query_texts)):
+                try:
+                    if image_list and len(image_list) > 0:
+                        # Handle PIL Images or processed tensors
+                        image = image_list[0] if isinstance(image_list, list) else image_list
+                        pred = model.generate_response(image, query)
+                        predictions.append(pred)
+                        
+                        # Handle references
+                        target = target_texts[i] if i < len(target_texts) else []
+                        if isinstance(target, list) and target:
+                            references.append(target[0])  # Use first reference
+                        elif isinstance(target, str):
+                            references.append(target)
+                        else:
+                            references.append("")
+                except Exception as e:
+                    print(f"Error processing sample {i}: {e}")
+                    predictions.append("")
+                    references.append("")
     
     # Compute metrics
-    metrics = compute_metrics(predictions, references)
+    if predictions and references:
+        metrics = compute_metrics(predictions, references, language=language)
+    else:
+        metrics = {}
+    
     return metrics
 
 def main():
@@ -115,21 +153,27 @@ def main():
     
     # Initialize wandb
     if args.use_wandb:
-        wandb.init(
-            project="woundwise-vqa",
-            config=args.__dict__
-        )
+        try:
+            wandb.init(
+                project="woundwise-vqa",
+                config=args.__dict__
+            )
+        except Exception as e:
+            print(f"Warning: Could not initialize wandb: {e}")
+            args.use_wandb = False
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Initialize model
+    print(f"Loading model: {args.model_name}")
     model = WoundWiseVQAModel(
         model_name=args.model_name,
         language=args.language
     ).to(device)
     
     # Create data loaders
+    print("Creating data loaders...")
     train_loader, valid_loader, test_loader = create_data_loaders(
         data_path=args.data_path,
         images_path=args.images_path,
@@ -138,6 +182,15 @@ def main():
         processor=model.processor,
         tokenizer=model.text_tokenizer
     )
+    
+    if not train_loader:
+        raise ValueError("No training data found!")
+    
+    print(f"Training samples: {len(train_loader.dataset)}")
+    if valid_loader:
+        print(f"Validation samples: {len(valid_loader.dataset)}")
+    if test_loader:
+        print(f"Test samples: {len(test_loader.dataset)}")
     
     # Setup optimizer and scheduler
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
@@ -160,7 +213,10 @@ def main():
         )
         
         # Validate
-        metrics = validate_model(model, valid_loader, device)
+        if valid_loader:
+            metrics = validate_model(model, valid_loader, device, args.language)
+        else:
+            metrics = {}
         
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Validation Metrics: {metrics}")
@@ -174,7 +230,7 @@ def main():
             })
         
         # Save best model
-        current_score = metrics.get('bleu', 0.0)
+        current_score = metrics.get('bleu', metrics.get('nltk_bleu4', 0.0))
         if current_score > best_score:
             best_score = current_score
             torch.save(
@@ -184,9 +240,12 @@ def main():
             print(f"New best model saved with score: {best_score:.4f}")
     
     # Final evaluation on test set
-    print("\nEvaluating on test set...")
-    test_metrics = validate_model(model, test_loader, device)
-    print(f"Test Metrics: {test_metrics}")
+    if test_loader:
+        print("\nEvaluating on test set...")
+        test_metrics = validate_model(model, test_loader, device, args.language)
+        print(f"Test Metrics: {test_metrics}")
+    else:
+        test_metrics = {}
     
     # Save final results
     results = {
